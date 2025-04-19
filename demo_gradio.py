@@ -68,8 +68,8 @@ def load_florence():
 
 def format_caption_for_video(caption):
     """
-    Creates a video-optimized prompt that describes both the current scene 
-    and suggests specific actions/movements for the video generation.
+    Prepares the raw Florence-2 caption for video generation by cleaning it up
+    and adding a simple transition phrase.
     """
     if not caption or caption == "No caption generated":
         return "A person in motion, first standing poised, then beginning to dance with flowing movements, arms gracefully extending outward, followed by a gentle spin."
@@ -92,42 +92,8 @@ def format_caption_for_video(caption):
     if cleaned_caption and cleaned_caption[0].islower():
         cleaned_caption = cleaned_caption[0].upper() + cleaned_caption[1:]
     
-    # Extract key information from the caption
-    has_person = any(word in cleaned_caption.lower() for word in ["person", "woman", "man", "girl", "boy", "performer", "dancer", "model", "athlete", "wrestler", "singer"])
-    
-    # Detect environment/context clues
-    is_stage = any(word in cleaned_caption.lower() for word in ["stage", "concert", "performance", "show", "spotlight", "performing"])
-    is_formal = any(word in cleaned_caption.lower() for word in ["formal", "elegant", "gown", "suit", "dress", "ceremony"])
-    is_casual = any(word in cleaned_caption.lower() for word in ["casual", "jeans", "t-shirt", "everyday", "street"])
-    is_athletic = any(word in cleaned_caption.lower() for word in ["athletic", "sport", "workout", "exercise", "gym", "fitness", "wrestling", "match"])
-    is_dance = any(word in cleaned_caption.lower() for word in ["dance", "dancing", "dancer", "choreography", "ballet", "performance"])
-    
-    # Begin constructing the enhanced prompt - preserve original description
-    prompt = f"{cleaned_caption}"
-    
-    # Add transition phrase
-    prompt += " In the following seconds, "
-    
-    # Generate contextually appropriate action sequence based on detected elements
-    if is_stage and has_person:
-        if is_dance:
-            prompt += "the performer continues their routine with a series of synchronized movements. They extend their arms gracefully, then execute a controlled spin, followed by a dramatic pose with head tilted upward. The movements are fluid and captivating, perfectly timed with the rhythm."
-        elif is_athletic:
-            prompt += "the athlete demonstrates their skill with a sequence of dynamic movements. They shift their weight confidently from one foot to the other, raise their arms in a gesture of triumph, and then move forward with purposeful strides, engaging with the audience through expressive facial expressions."
-        else:
-            prompt += "the performer engages the audience with charismatic gestures. They raise one arm slowly, then bring it down while turning slightly to the side. Their expression changes from intense to smiling as they move across the stage with deliberate, confident steps."
-    
-    elif has_person:
-        if is_formal:
-            prompt += "the subject makes elegant, poised movements. They slightly adjust their posture, turning gracefully to reveal different angles. Their hands move in subtle, refined gestures while maintaining perfect composure, conveying sophistication through minimal but impactful movements."
-        elif is_casual or is_athletic:
-            prompt += "the subject begins a natural sequence of movements. First, they shift their weight and change their stance, then they gesture expressively with their hands while their facial expression becomes more animated. The movements progress from subtle to more dynamic as they appear to speak or respond to something off-camera."
-        else:
-            prompt += "the subject transitions into a sequence of expressive movements. They first turn slightly to change perspective, then make a deliberate gesture with their hands. Their expression shifts subtly as they continue to move with purpose, creating a natural flow of motion that reveals their personality."
-    
-    else:
-        # Generic action sequence for non-person subjects
-        prompt += "the scene develops with subtle dynamic elements. Movement flows through the frame in a natural progression, with shifting perspectives and gentle transitions that bring the static image to life."
+    # Just add a simple transition phrase to suggest motion
+    prompt = f"{cleaned_caption} The scene comes to life with natural movements and animations, Fluid motion and lifelike expressions."
     
     return prompt
 
@@ -139,9 +105,9 @@ def generate_caption(image):
     try:
         florence_model.to(gpu)
         
-        # Use MORE_DETAILED_CAPTION for richer descriptions
-        prompt = "<MORE_DETAILED_CAPTION>"
-        inputs = florence_processor(text=prompt, images=image, return_tensors="pt").to(gpu, torch.float16)
+        # First get a detailed caption of the image
+        caption_prompt = "<MORE_DETAILED_CAPTION>"
+        inputs = florence_processor(text=caption_prompt, images=image, return_tensors="pt").to(gpu, torch.float16)
         
         generated_ids = florence_model.generate(
             input_ids=inputs["input_ids"],
@@ -153,11 +119,39 @@ def generate_caption(image):
         
         generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
         parsed_caption = florence_processor.post_process_generation(generated_text, task="<MORE_DETAILED_CAPTION>")
-        
         raw_caption = parsed_caption.get("<MORE_DETAILED_CAPTION>", "No caption generated")
         
-        # Format the caption to suggest video motion
-        video_prompt = format_caption_for_video(raw_caption)
+        # Now ask Florence to create a video prompt based on the caption
+        video_prompt_instruction = f"Based on this image description: '{raw_caption}', create a detailed 2-3 sentence prompt describing how this scene would naturally animate in a short video clip. Include specific motions, expressions, and transitions that would make sense for the subject."
+        
+        inputs = florence_processor(text=video_prompt_instruction, images=image, return_tensors="pt").to(gpu, torch.float16)
+        
+        generated_ids = florence_model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=1024,
+            num_beams=3,
+            do_sample=True,
+            temperature=0.7
+        )
+        
+        generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        
+        # Try to extract the prompt from Florence's response
+        try:
+            # This is a simple extraction - Florence might format its response in different ways
+            lines = [line for line in generated_text.split('\n') if line.strip()]
+            video_prompt = ""
+            for line in lines:
+                if ":" not in line[:20] and "<" not in line and ">" not in line:
+                    video_prompt += line + " "
+            
+            # If we couldn't extract a good prompt, fall back to formatting the original caption
+            if len(video_prompt.strip()) < 20:
+                video_prompt = format_caption_for_video(raw_caption)
+        except:
+            # If anything goes wrong in extraction, fall back to the simple format
+            video_prompt = format_caption_for_video(raw_caption)
         
         florence_model.to(cpu)
         torch.cuda.empty_cache()
@@ -224,16 +218,19 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
+    
+    # Convert resolution to integer
+    resolution = int(resolution)
 
     job_id = generate_timestamp()
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
-        # Generate caption using Florence-2 if requested
+        # Generate caption using Florence-2 if requested and no prompt is provided
         if use_florence and prompt.strip() == "":
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Generating caption with Florence-2 ...'))))
             generated_prompt = generate_caption(Image.fromarray(input_image))
@@ -271,7 +268,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
         H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=640)
+        height, width = find_nearest_bucket(H, W, resolution=resolution)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
@@ -448,7 +445,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -456,7 +453,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution)
 
     output_filename = None
     generated_prompt = None
@@ -494,12 +491,37 @@ def end_process():
     stream.input_queue.push('end')
 
 
-quick_prompts = [
-    'The girl dances gracefully, with clear movements, full of charm.',
-    'A character doing some simple body movements.',
-]
-quick_prompts = [[x] for x in quick_prompts]
-
+def process_caption(input_image):
+    if input_image is None:
+        return "Please upload an image first", gr.update(), "", ""
+    
+    try:
+        # Display progress information
+        progress_html = make_progress_bar_html(0, 'Loading Florence-2 model...')
+        
+        if not load_florence():
+            return "Failed to load Florence-2 model", gr.update(), "", ""
+        
+        # Update progress
+        progress_html = make_progress_bar_html(50, 'Generating caption...')
+        
+        # Move model to GPU for inference
+        florence_model.to(gpu)
+        generated_prompt = generate_caption(Image.fromarray(input_image))
+        
+        # Move model back to CPU to free GPU memory
+        florence_model.to(cpu)
+        torch.cuda.empty_cache()
+        
+        # Clear progress indicators once done
+        return generated_prompt, gr.update(), "", ""
+        
+    except Exception as e:
+        print(f"Error generating caption: {e}")
+        if florence_model is not None:
+            florence_model.to(cpu)
+        torch.cuda.empty_cache()
+        return "Error generating caption. Please try again or enter prompt manually.", gr.update(), "", ""
 
 css = make_progress_bar_css()
 block = gr.Blocks(css=css, title="FramePack").queue()
@@ -508,9 +530,17 @@ with block:
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
-            prompt = gr.Textbox(label="Prompt", value='')
-            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
-            example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
+            
+            with gr.Row():
+                prompt = gr.Textbox(label="Prompt", value='')
+                caption_button = gr.Button(value="📝 Generate Caption")
+            
+            resolution = gr.Dropdown(
+                label="Resolution", 
+                choices=["512", "576", "640", "704", "768", "832", "896", "960", "1024"], 
+                value="640",
+                info="Higher resolutions require more VRAM and may slow down processing"
+            )
 
             with gr.Row():
                 start_button = gr.Button(value="Start Generation")
@@ -518,7 +548,7 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
-                use_florence = gr.Checkbox(label='Use Florence-2 for Auto-Captioning', value=True, info='Automatically generate a prompt from your image using Florence-2.')
+                use_florence = gr.Checkbox(label='Use Florence-2 during Generation', value=False, info='Automatically generate a prompt if none is provided when starting generation.')
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 
@@ -551,8 +581,9 @@ with block:
         return np.random.randint(0, 2**31 - 1)
     
     random_seed_button.click(fn=generate_random_seed, inputs=[], outputs=[seed])
+    caption_button.click(fn=process_caption, inputs=[input_image], outputs=[prompt, preview_image, progress_desc, progress_bar])
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, prompt])
     end_button.click(fn=end_process)
 
