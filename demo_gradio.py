@@ -468,9 +468,9 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
         if flag == 'end':
             if generated_prompt is not None:
-                yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), gr.update(value="")
+                yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), gr.update(value=generated_prompt)
             else:
-                yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), gr.update(value="")
+                yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), gr.update()
             break
 
 
