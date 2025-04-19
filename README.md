@@ -1,5 +1,5 @@
 # A modified version with Florence-2 auto caption (Prompt) and random seed
-![Screenshot 2025-04-19 131021](https://github.com/user-attachments/assets/57391a6f-cedf-425f-991e-091fee65c9e5)
+![Screenshot 2025-04-19 132149](https://github.com/user-attachments/assets/72b3f097-1535-4543-86f7-4e07843d169c)
 
 
 
