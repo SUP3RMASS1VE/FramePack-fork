@@ -218,7 +218,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
     
@@ -230,15 +230,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
-        # Generate caption using Florence-2 if requested and no prompt is provided
-        if use_florence and prompt.strip() == "":
-            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Generating caption with Florence-2 ...'))))
-            generated_prompt = generate_caption(Image.fromarray(input_image))
-            prompt = generated_prompt
-            stream.output_queue.push(('prompt_update', prompt))
-            print(f"Generated prompt: {prompt}")
-            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Using generated caption: {prompt}'))))
-
         # Clean GPU
         if not high_vram:
             unload_complete_models(
@@ -445,7 +436,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -453,7 +444,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution)
 
     output_filename = None
     generated_prompt = None
@@ -474,10 +465,6 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
                 yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), gr.update(value=generated_prompt)
             else:
                 yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), gr.update()
-
-        if flag == 'prompt_update':
-            generated_prompt = data
-            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(value=generated_prompt)
 
         if flag == 'end':
             if generated_prompt is not None:
@@ -548,7 +535,6 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
-                use_florence = gr.Checkbox(label='Use Florence-2 during Generation', value=False, info='Automatically generate a prompt if none is provided when starting generation.')
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 
@@ -583,7 +569,7 @@ with block:
     random_seed_button.click(fn=generate_random_seed, inputs=[], outputs=[seed])
     caption_button.click(fn=process_caption, inputs=[input_image], outputs=[prompt, preview_image, progress_desc, progress_bar])
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence, resolution]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, prompt])
     end_button.click(fn=end_process)
 
