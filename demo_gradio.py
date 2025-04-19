@@ -523,8 +523,8 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 
                 with gr.Row():
-                    seed = gr.Number(label="Seed", value=31337, precision=0)
-                    random_seed_button = gr.Button(value="🎲 Random", size="sm")
+                    seed = gr.Number(label="Seed", value=31337, precision=0, scale=4)
+                    random_seed_button = gr.Button(value="🎲 Random", size="sm", scale=1)
 
                 total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
