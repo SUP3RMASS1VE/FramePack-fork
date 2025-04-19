@@ -1,3 +1,8 @@
+# A modified version with Forence-2 auto caption (Prompt) and random seed
+![Screenshot 2025-04-19 131021](https://github.com/user-attachments/assets/57391a6f-cedf-425f-991e-091fee65c9e5)
+
+
+
 <p align="center">
     <img src="https://github.com/user-attachments/assets/2cc030b4-87e1-40a0-b5bf-1b7d6b62820b" width="300">
 </p>
