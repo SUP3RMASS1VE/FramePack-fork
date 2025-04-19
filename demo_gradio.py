@@ -12,10 +12,12 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+import requests
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
+from transformers import AutoProcessor, AutoModelForCausalLM
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
@@ -30,9 +32,13 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
-parser.add_argument("--server", type=str, default='127.0.0.1')
-parser.add_argument("--port", type=int, default=7860)
+parser.add_argument("--server", type=str, default='0.0.0.0')
+parser.add_argument("--port", type=int, required=False)
+parser.add_argument("--inbrowser", action='store_true')
 args = parser.parse_args()
+
+# for win desktop probably use --server 127.0.0.1 --inbrowser
+# For linux server probably use --server 127.0.0.1 or do not use any cmd flags
 
 print(args)
 
@@ -41,6 +47,128 @@ high_vram = free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
+
+# Load Florence-2 model for captioning
+florence_processor = None
+florence_model = None
+
+def load_florence():
+    global florence_processor, florence_model
+    if florence_processor is None or florence_model is None:
+        try:
+            print("Loading Florence-2 model for captioning...")
+            florence_processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True)
+            florence_model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-large", torch_dtype=torch.float16, trust_remote_code=True)
+            florence_model.to(cpu)
+            print("Florence-2 model loaded successfully")
+        except Exception as e:
+            print(f"Error loading Florence-2 model: {e}")
+            return False
+    return True
+
+def format_caption_for_video(caption):
+    """
+    Creates a video-optimized prompt that describes both the current scene 
+    and suggests specific actions/movements for the video generation.
+    """
+    if not caption or caption == "No caption generated":
+        return "A person in motion, first standing poised, then beginning to dance with flowing movements, arms gracefully extending outward, followed by a gentle spin."
+    
+    # Clean up the caption by removing common introductory phrases
+    intro_phrases = [
+        "The image shows ", "The image is a portrait of ", "The image depicts ", 
+        "This is a photo of ", "This is an image of ", "The image is of ", 
+        "The photo shows ", "The picture shows ", "This picture shows ",
+        "The image contains ", "The photo is of ", "The image features "
+    ]
+    
+    cleaned_caption = caption
+    for phrase in intro_phrases:
+        if cleaned_caption.startswith(phrase):
+            cleaned_caption = cleaned_caption[len(phrase):]
+            break
+    
+    # Capitalize the first letter if needed
+    if cleaned_caption and cleaned_caption[0].islower():
+        cleaned_caption = cleaned_caption[0].upper() + cleaned_caption[1:]
+    
+    # Extract key information from the caption
+    has_person = any(word in cleaned_caption.lower() for word in ["person", "woman", "man", "girl", "boy", "performer", "dancer", "model", "athlete", "wrestler", "singer"])
+    
+    # Detect environment/context clues
+    is_stage = any(word in cleaned_caption.lower() for word in ["stage", "concert", "performance", "show", "spotlight", "performing"])
+    is_formal = any(word in cleaned_caption.lower() for word in ["formal", "elegant", "gown", "suit", "dress", "ceremony"])
+    is_casual = any(word in cleaned_caption.lower() for word in ["casual", "jeans", "t-shirt", "everyday", "street"])
+    is_athletic = any(word in cleaned_caption.lower() for word in ["athletic", "sport", "workout", "exercise", "gym", "fitness", "wrestling", "match"])
+    is_dance = any(word in cleaned_caption.lower() for word in ["dance", "dancing", "dancer", "choreography", "ballet", "performance"])
+    
+    # Begin constructing the enhanced prompt - preserve original description
+    prompt = f"{cleaned_caption}"
+    
+    # Add transition phrase
+    prompt += " In the following seconds, "
+    
+    # Generate contextually appropriate action sequence based on detected elements
+    if is_stage and has_person:
+        if is_dance:
+            prompt += "the performer continues their routine with a series of synchronized movements. They extend their arms gracefully, then execute a controlled spin, followed by a dramatic pose with head tilted upward. The movements are fluid and captivating, perfectly timed with the rhythm."
+        elif is_athletic:
+            prompt += "the athlete demonstrates their skill with a sequence of dynamic movements. They shift their weight confidently from one foot to the other, raise their arms in a gesture of triumph, and then move forward with purposeful strides, engaging with the audience through expressive facial expressions."
+        else:
+            prompt += "the performer engages the audience with charismatic gestures. They raise one arm slowly, then bring it down while turning slightly to the side. Their expression changes from intense to smiling as they move across the stage with deliberate, confident steps."
+    
+    elif has_person:
+        if is_formal:
+            prompt += "the subject makes elegant, poised movements. They slightly adjust their posture, turning gracefully to reveal different angles. Their hands move in subtle, refined gestures while maintaining perfect composure, conveying sophistication through minimal but impactful movements."
+        elif is_casual or is_athletic:
+            prompt += "the subject begins a natural sequence of movements. First, they shift their weight and change their stance, then they gesture expressively with their hands while their facial expression becomes more animated. The movements progress from subtle to more dynamic as they appear to speak or respond to something off-camera."
+        else:
+            prompt += "the subject transitions into a sequence of expressive movements. They first turn slightly to change perspective, then make a deliberate gesture with their hands. Their expression shifts subtly as they continue to move with purpose, creating a natural flow of motion that reveals their personality."
+    
+    else:
+        # Generic action sequence for non-person subjects
+        prompt += "the scene develops with subtle dynamic elements. Movement flows through the frame in a natural progression, with shifting perspectives and gentle transitions that bring the static image to life."
+    
+    return prompt
+
+@torch.no_grad()
+def generate_caption(image):
+    if not load_florence():
+        return "Failed to load Florence-2 model for captioning"
+    
+    try:
+        florence_model.to(gpu)
+        
+        # Use MORE_DETAILED_CAPTION for richer descriptions
+        prompt = "<MORE_DETAILED_CAPTION>"
+        inputs = florence_processor(text=prompt, images=image, return_tensors="pt").to(gpu, torch.float16)
+        
+        generated_ids = florence_model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=1024,
+            num_beams=3,
+            do_sample=False
+        )
+        
+        generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        parsed_caption = florence_processor.post_process_generation(generated_text, task="<MORE_DETAILED_CAPTION>")
+        
+        raw_caption = parsed_caption.get("<MORE_DETAILED_CAPTION>", "No caption generated")
+        
+        # Format the caption to suggest video motion
+        video_prompt = format_caption_for_video(raw_caption)
+        
+        florence_model.to(cpu)
+        torch.cuda.empty_cache()
+        
+        return video_prompt
+    except Exception as e:
+        print(f"Error generating caption: {e}")
+        if florence_model is not None:
+            florence_model.to(cpu)
+        torch.cuda.empty_cache()
+        return "Error generating caption"
 
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
@@ -96,7 +224,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -105,6 +233,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
+        # Generate caption using Florence-2 if requested
+        if use_florence and prompt.strip() == "":
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Generating caption with Florence-2 ...'))))
+            generated_prompt = generate_caption(Image.fromarray(input_image))
+            prompt = generated_prompt
+            stream.output_queue.push(('prompt_update', prompt))
+            print(f"Generated prompt: {prompt}")
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Using generated caption: {prompt}'))))
+
         # Clean GPU
         if not high_vram:
             unload_complete_models(
@@ -291,7 +428,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=30)
+            save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
 
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
@@ -311,31 +448,45 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence):
     global stream
     assert input_image is not None, 'No input image!'
 
-    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True), gr.update(value=prompt)
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence)
 
     output_filename = None
+    generated_prompt = None
 
     while True:
         flag, data = stream.output_queue.next()
 
         if flag == 'file':
             output_filename = data
-            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+            if generated_prompt is not None:
+                yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), gr.update(value=generated_prompt)
+            else:
+                yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), gr.update()
 
         if flag == 'progress':
             preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+            if generated_prompt is not None:
+                yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), gr.update(value=generated_prompt)
+            else:
+                yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), gr.update()
+
+        if flag == 'prompt_update':
+            generated_prompt = data
+            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(value=generated_prompt)
 
         if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+            if generated_prompt is not None:
+                yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), gr.update(value=generated_prompt)
+            else:
+                yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), gr.update()
             break
 
 
@@ -351,7 +502,7 @@ quick_prompts = [[x] for x in quick_prompts]
 
 
 css = make_progress_bar_css()
-block = gr.Blocks(css=css, title="Frame Pack").queue()
+block = gr.Blocks(css=css, title="FramePack").queue()
 with block:
     gr.Markdown('# FramePack')
     with gr.Row():
@@ -367,9 +518,13 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                use_florence = gr.Checkbox(label='Use Florence-2 for Auto-Captioning', value=True, info='Automatically generate a prompt from your image using Florence-2.')
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
-                seed = gr.Number(label="Seed", value=31337, precision=0)
+                
+                with gr.Row():
+                    seed = gr.Number(label="Seed", value=31337, precision=0)
+                    random_seed_button = gr.Button(value="🎲 Random", size="sm")
 
                 total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
@@ -381,14 +536,24 @@ with block:
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
+                mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
+
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
             result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache]
-    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+
+    gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
+
+    def generate_random_seed():
+        return np.random.randint(0, 2**31 - 1)
+    
+    random_seed_button.click(fn=generate_random_seed, inputs=[], outputs=[seed])
+
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, use_florence]
+    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, prompt])
     end_button.click(fn=end_process)
 
 
@@ -396,4 +561,5 @@ block.launch(
     server_name=args.server,
     server_port=args.port,
     share=args.share,
+    inbrowser=args.inbrowser,
 )
